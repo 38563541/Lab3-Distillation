@@ -343,4 +343,4 @@ class StableDiffusion(nn.Module):
         posterior = self.vae.encode(imgs).latent_dist
         latents = posterior.sample() * self.vae.config.scaling_factor
         return latents
-PY
+
