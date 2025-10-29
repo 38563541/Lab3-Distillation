@@ -128,7 +128,6 @@ class StableDiffusion(nn.Module):
         
         # sample noise
         noise = torch.randn_like(latents, device=latents.device, dtype=latents.dtype)
-
         
         # noisy latents x_t
         latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
@@ -141,24 +140,27 @@ class StableDiffusion(nn.Module):
         #  - text_embeddings has shape (2*B, seq, dim) => already [uncond, cond]
         #  - text_embeddings has shape (B, seq, dim) => create uncond and cat
         if text_embeddings is None:
-            # fallback: empty prompt
-            uncond = self.get_text_embeds([""] * B)
+            uncond = self.get_text_embeds([""] * B).to(device)
             cond = uncond
             text_embeddings_cat = torch.cat([uncond, cond], dim=0)
         else:
             if text_embeddings.shape[0] == B:
                 # create unconditional empty embeddings
                 uncond = self.get_text_embeds([""] * B).to(device)
-                text_embeddings_cat = torch.cat([uncond, text_embeddings], dim=0)
+                text_embeddings_cat = torch.cat([uncond, text_embeddings.to(device)], dim=0)
             else:
                 text_embeddings_cat = text_embeddings.to(device)
         
         # predict noise
-        noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
+        noise_pred = self.get_noise_preds(
+            latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale
+        )
         
         # MSE loss between predicted noise and true noise
         loss = F.mse_loss(noise_pred, noise, reduction='mean')
+        
         return loss
+    
     
     def get_vsd_loss(self, latents, text_embeddings, guidance_scale=7.5, lora_loss_weight=1.0):
         """
