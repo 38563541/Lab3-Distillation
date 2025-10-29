@@ -107,61 +107,51 @@ class StableDiffusion(nn.Module):
     def get_sds_loss(self, latents, text_embeddings, guidance_scale=7.5):
         """
         Score Distillation Sampling (SDS) Loss
-        
         Reference: DreamFusion (https://arxiv.org/abs/2209.14988)
         """
-        # TODO: Implement SDS loss
-        # Implementation choices:
-        # - sample a timestep t uniformly between min_step and max_step
-        # - sample gaussian noise epsilon
-        # - construct noisy latents x_t = sqrt(alpha_t) * x0 + sqrt(1 - alpha_t) * epsilon
-        # - predict epsilon_pred via unet with classifier-free-guidance (text_embeddings assumed to be concatenated [uncond, cond])
-        # - mse loss between epsilon_pred and epsilon (mean over batch)
-        
         B = latents.shape[0]
         device = latents.device
-        
-        # sample timesteps uniformly per example (as integers)
+    
+        # sample t uniformly
         t_int = torch.randint(self.min_step, self.max_step + 1, (B,), device=device)
-        # get alpha_t values
-        alpha_t = self.alphas[t_int].to(device)  # (B,)
+        alpha_t = self.alphas[t_int].to(device)
         sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
-        
-        # sample noise (ensure dtype/device match latents)
+    
+        # sample noise
         noise = torch.randn_like(latents, device=device, dtype=latents.dtype)
-        
-        # noisy latents x_t
+    
+        # create noisy latents
         latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
-        
-        # prepare timestep tensor for unet (must be same dtype & device)
         t_tensor = t_int.to(device).long()
-        
-        # ensure text_embeddings: if user passed only cond embeddings, construct uncond
-        # Accept two forms:
-        #  - text_embeddings has shape (2*B, seq, dim) => already [uncond, cond]
-        #  - text_embeddings has shape (B, seq, dim) => create uncond and cat
-        if text_embeddings is None:
+    
+        # make sure text embeddings include unconditional
+        if text_embeddings is None or text_embeddings.shape[0] == B:
             uncond = self.get_text_embeds([""] * B).to(device)
-            cond = uncond
+            cond = text_embeddings.to(device) if text_embeddings is not None else uncond
             text_embeddings_cat = torch.cat([uncond, cond], dim=0)
         else:
-            if text_embeddings.shape[0] == B:
-                # create unconditional empty embeddings
-                uncond = self.get_text_embeds([""] * B).to(device)
-                text_embeddings_cat = torch.cat([uncond, text_embeddings.to(device)], dim=0)
-            else:
-                text_embeddings_cat = text_embeddings.to(device)
-        
-        # predict noise with classifier-free guidance
-        noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
-        
-        # MSE loss between predicted noise and true noise
-        # Use timestep weight to stabilize (w(t) = 1 - alpha_t)
-        w_t = (1.0 - alpha_t).view(B, 1, 1, 1)
-        loss = (w_t * (noise_pred - noise) ** 2).mean()
-        return loss
+            text_embeddings_cat = text_embeddings.to(device)
     
+        # predict noise
+        noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
+    
+        # gradient direction
+        grad = (noise_pred - noise)
+    
+        # weight by (1 - alpha_t)
+        w_t = (1.0 - alpha_t).view(B, 1, 1, 1)
+        grad = w_t * grad
+    
+        # compute loss (for monitoring)
+        loss = grad.pow(2).mean()
+    
+        # update latents manually outside this function (in main.py)
+        # or rely on autograd to backprop through loss
+        return loss
+
+
+
     def get_vsd_loss(self, latents, text_embeddings, guidance_scale=7.5, lora_loss_weight=1.0):
         """
         Variational Score Distillation (VSD) Loss
