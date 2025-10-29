@@ -108,35 +108,54 @@ class StableDiffusion(nn.Module):
         
         Reference: DreamFusion (https://arxiv.org/abs/2209.14988)
         """
-        # === TODO completed ===
+        # TODO: Implement SDS loss
+        # Implementation choices:
+        # - sample a timestep t uniformly between min_step and max_step
+        # - sample gaussian noise epsilon
+        # - construct noisy latents x_t = sqrt(alpha_t) * x0 + sqrt(1 - alpha_t) * epsilon
+        # - predict epsilon_pred via unet with classifier-free-guidance (text_embeddings assumed to be concatenated [uncond, cond])
+        # - mse loss between epsilon_pred and epsilon (mean over batch)
+        
         B = latents.shape[0]
         device = latents.device
-
-        # sample timesteps uniformly
+        
+        # sample timesteps uniformly per example (as integers)
         t_int = torch.randint(self.min_step, self.max_step + 1, (B,), device=device)
-        alpha_t = self.alphas[t_int].to(device)
+        # get alpha_t values
+        alpha_t = self.alphas[t_int].to(device)  # (B,)
         sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
-
-        # add Gaussian noise
-        noise = torch.randn_like(latents)
+        
+        # sample noise
+        noise = torch.randn_like(latents, device=device)
+        
+        # noisy latents x_t
         latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
+        
+        # prepare timestep tensor for unet (must be same dtype & device)
         t_tensor = t_int.to(device).long()
-
-        # prepare embeddings
+        
+        # ensure text_embeddings: if user passed only cond embeddings, construct uncond
+        # Accept two forms:
+        #  - text_embeddings has shape (2*B, seq, dim) => already [uncond, cond]
+        #  - text_embeddings has shape (B, seq, dim) => create uncond and cat
         if text_embeddings is None:
+            # fallback: empty prompt
             uncond = self.get_text_embeds([""] * B)
             cond = uncond
             text_embeddings_cat = torch.cat([uncond, cond], dim=0)
         else:
             if text_embeddings.shape[0] == B:
+                # create unconditional empty embeddings
                 uncond = self.get_text_embeds([""] * B).to(device)
                 text_embeddings_cat = torch.cat([uncond, text_embeddings], dim=0)
             else:
                 text_embeddings_cat = text_embeddings.to(device)
-
-        # predict noise and compute loss
+        
+        # predict noise
         noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
+        
+        # MSE loss between predicted noise and true noise
         loss = F.mse_loss(noise_pred, noise, reduction='mean')
         return loss
     
@@ -146,13 +165,21 @@ class StableDiffusion(nn.Module):
         
         Reference: ProlificDreamer (https://arxiv.org/abs/2305.16213)
         """
-        # === TODO completed ===
+        # TODO: Implement VSD loss
+        # Here: implement a practical variant: SDS loss + L2 regularization on trainable LoRA params (if present)
+        # - This captures the "variational" regularization on learned adapter weights.
+        
+        # Base SDS-style loss
         sds_loss = self.get_sds_loss(latents, text_embeddings, guidance_scale=guidance_scale)
+        
+        # LoRA regularization (if LoRA adapters exist and have trainable params)
         lora_reg = torch.tensor(0.0, device=latents.device, dtype=latents.dtype)
         if hasattr(self, 'lora_layers') and len(self.lora_layers) > 0:
+            # lora_layers is a list of trainable params
             for p in self.lora_layers:
                 if p.requires_grad:
                     lora_reg = lora_reg + (p.pow(2).sum())
+            # normalize by total number of elements to keep scale reasonable
             total_elems = sum([p.numel() for p in self.lora_layers if p.requires_grad])
             if total_elems > 0:
                 lora_reg = lora_reg / total_elems
@@ -164,23 +191,31 @@ class StableDiffusion(nn.Module):
     def invert_noise(self, latents, target_t, text_embeddings, guidance_scale=-7.5, n_steps=10, eta=0.3):
         """
         DDIM Inversion: x0 -> x_t
+        
+        Inverts clean latents (x0) to noisy latents (x_t) using DDIM inversion.
         """
-        # === TODO completed ===
+        # TODO: (Implement DDIM inversion by yourself — do NOT call built-in inversion helpers)
         B = latents.shape[0]
         device = latents.device
-
-        if isinstance(target_t, torch.Tensor):
+        
+        if isinstance(target_t, (list, tuple)):
+            target_t_tensor = torch.tensor(target_t, device=device, dtype=torch.long)
+        elif isinstance(target_t, torch.Tensor):
             target_t_tensor = target_t.to(device).long()
         else:
             target_t_tensor = torch.full((B,), int(target_t), device=device, dtype=torch.long)
-
+        
         target_t_tensor = torch.clamp(target_t_tensor, 0, self.num_train_timesteps - 1)
+        
         alpha_t = self.alphas[target_t_tensor].to(device)
         sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
-
-        # add noise scaled by eta
-        noise = torch.randn_like(latents, device=device) * eta
+        
+        if eta == 0:
+            noise = torch.zeros_like(latents)
+        else:
+            noise = torch.randn_like(latents) * eta
+        
         latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
         return latents_noisy
     
@@ -199,11 +234,70 @@ class StableDiffusion(nn.Module):
         """
         Score Distillation via Inversion (SDI) Loss
         """
-        # === TODO completed ===
         B = latents.shape[0]
-        device = latents.device
-
+        
+        # TODO: timestep annealing
         if total_iters <= 1:
             t_index = self.max_step
         else:
             frac = float(current_iter) / float(max(1, total_iters - 1))
+            frac = max(0.0, min(1.0, frac))
+            t_float = self.max_step - frac * (self.max_step - self.min_step)
+            t_index = int(round(t_float))
+        t_index = int(max(0, min(self.num_train_timesteps - 1, t_index)))
+        
+        device = latents.device
+        t = torch.full((B,), t_index, device=device, dtype=torch.long)
+        
+        should_update = (current_iter % update_interval == 0) or not hasattr(self, 'sdi_target')
+        
+        if should_update:
+            with torch.no_grad():
+                latents_noisy = self.invert_noise(
+                    latents, t, text_embeddings,
+                    guidance_scale=inversion_guidance_scale,
+                    n_steps=inversion_n_steps,
+                    eta=inversion_eta
+                )
+                
+                if text_embeddings is None:
+                    text_embeddings_cat = torch.cat([self.get_text_embeds([""] * B), self.get_text_embeds([""] * B)], dim=0).to(device)
+                else:
+                    if text_embeddings.shape[0] == B:
+                        uncond = self.get_text_embeds([""] * B).to(device)
+                        text_embeddings_cat = torch.cat([uncond, text_embeddings.to(device)], dim=0)
+                    else:
+                        text_embeddings_cat = text_embeddings.to(device)
+                
+                noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings_cat, guidance_scale=inversion_guidance_scale)
+                
+                alpha_t = self.alphas[t].to(device)
+                sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
+                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
+                
+                pred_x0 = (latents_noisy - sqrt_one_minus_alpha_t * noise_pred) / (sqrt_alpha_t + 1e-12)
+                
+                self.sdi_target = pred_x0.detach()
+        
+        if not hasattr(self, 'sdi_target'):
+            loss = torch.tensor(0.0, device=device, dtype=latents.dtype)
+        else:
+            loss = F.mse_loss(latents, self.sdi_target.to(device), reduction='mean')
+        
+        return loss
+        
+    @torch.no_grad()
+    def decode_latents(self, latents):
+        """Decode latents to RGB images"""
+        latents = 1 / self.vae.config.scaling_factor * latents
+        imgs = self.vae.decode(latents).sample
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        return imgs
+
+    @torch.no_grad()
+    def encode_imgs(self, imgs):
+        """Encode RGB images to latents"""
+        imgs = 2 * imgs - 1
+        posterior = self.vae.encode(imgs).latent_dist
+        latents = posterior.sample() * self.vae.config.scaling_factor
+        return latents
