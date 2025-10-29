@@ -127,7 +127,8 @@ class StableDiffusion(nn.Module):
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
         
         # sample noise
-        noise = torch.randn_like(latents, device=device)
+        noise = torch.randn_like(latents, device=latents.device, dtype=latents.dtype)
+
         
         # noisy latents x_t
         latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
