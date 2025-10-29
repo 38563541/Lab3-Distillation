@@ -321,13 +321,30 @@ class StableDiffusion(nn.Module):
         return loss
         
     @torch.no_grad()
+    
     def decode_latents(self, latents):
         """Decode latents to RGB images"""
-        # scale latents by VAE scaling_factor before decoding
-        latents = 1 / self.vae.config.scaling_factor * latents
+        # --- make sure dtype & scaling factor match VAE expectation ---
+        # SD 2.1 base expects latent scaled by 0.18215 (same as vae.config.scaling_factor)
+        # We must cast to float32 for decoding, even if pipeline runs in fp16.
+        latents = latents.to(self.vae.dtype)
+        if hasattr(self.vae.config, "scaling_factor"):
+            latents = latents / self.vae.config.scaling_factor
+        else:
+            latents = latents / 0.18215  # fallback
+        
         imgs = self.vae.decode(latents).sample
-        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)  # scale to [0,1]
+        imgs = imgs.float()  # convert for visualization
         return imgs
+
+    #def decode_latents(self, latents):
+    #    """Decode latents to RGB images"""
+    #    # scale latents by VAE scaling_factor before decoding
+    #    latents = 1 / self.vae.config.scaling_factor * latents
+    #    imgs = self.vae.decode(latents).sample
+    #    imgs = (imgs / 2 + 0.5).clamp(0, 1)
+    #    return imgs
 
     @torch.no_grad()
     def encode_imgs(self, imgs):
