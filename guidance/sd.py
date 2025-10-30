@@ -109,75 +109,52 @@ class StableDiffusion(nn.Module):
         Score Distillation Sampling (SDS) Loss
         Reference: DreamFusion (https://arxiv.org/abs/2209.14988)
         """
-        #B = latents.shape[0]
-        #device = latents.device
-#
-        ## sample t uniformly
-        #t_int = torch.randint(self.min_step, self.max_step + 1, (B,), device=device)
-        #alpha_t = self.alphas[t_int].to(device)
-        #sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
-        #sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
-#
-        ## sample noise
-        #noise = torch.randn_like(latents, device=device, dtype=latents.dtype)
-#
-        ## create noisy latents
-        #latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
-        #t_tensor = t_int.to(device).long()
-#
-        ## make sure text embeddings include unconditional
-        #if text_embeddings is None or text_embeddings.shape[0] == B:
-        #    uncond = self.get_text_embeds([""] * B).to(device)
-        #    cond = text_embeddings.to(device) if text_embeddings is not None else uncond
-        #    text_embeddings_cat = torch.cat([uncond, cond], dim=0)
-        #else:
-        #    text_embeddings_cat = text_embeddings.to(device)
-        #
-        ## --- ensure dtype consistency with UNet (important for fp16 pipelines) ---
-        #unet_dtype = next(self.unet.parameters()).dtype
-        #latents_noisy = latents_noisy.to(dtype=unet_dtype)
-        #text_embeddings_cat = text_embeddings_cat.to(dtype=unet_dtype)
-        #
-        ## predict noise
-        #noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
-#
-        ## gradient direction
-        #grad = (noise_pred - noise)
-#
-        ## weight by (1 - alpha_t)
-        #w_t = (1.0 - alpha_t).view(B, 1, 1, 1)
-        #grad = w_t * grad
-#
-        ## --- [!!!] START OF FIX [!!!] ---
-        ##
-        ##
-        ## 1. We want to perform gradient ASCENT on `grad`.
-        ## 2. The optimizer performs gradient DESCENT (minimizes loss).
-        ## 3. We need a loss L where dL/d(latents) = -grad (or proportional).
-        ##
-        ## We define the loss on `latents_noisy` and let autograd handle the
-        ## chain rule (d(loss)/d(latents) = d(loss)/d(noisy) * d(noisy)/d(latents))
-        ##
-        ## d(noisy)/d(latents) is sqrt_alpha_t
-        ## We want d(loss)/d(noisy) = -grad
-        #
-        ## Detach grad to treat it as a constant target
-        #grad_detached = grad.detach()
-#
-        ## Define a target for latents_noisy that will move it "away" from noise
-        ## target = latents_noisy - (-grad_detached) = latents_noisy + grad_detached
-        #target = (latents_noisy + grad_detached).detach()
-#
-        ## Compute the loss
-        ## The gradient d(loss)/d(latents_noisy) will be (latents_noisy - target) = -grad_detached
-        #loss = 0.5 * F.mse_loss(latents_noisy, target, reduction="mean")
-        #
-        ## --- [!!!] END OF FIX [!!!] ---
-        # 1. 創建一個全為 0 的目標
-        target_zeros = torch.zeros_like(latents)
+        B = latents.shape[0]
+        device = latents.device
+
+        # sample t uniformly
+        t_int = torch.randint(self.min_step, self.max_step + 1, (B,), device=device)
+        alpha_t = self.alphas[t_int].to(device)
+        sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
+
+        # sample noise
+        noise = torch.randn_like(latents, device=device, dtype=latents.dtype)
+
+        # create noisy latents
+        latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
+        t_tensor = t_int.to(device).long()
+
+        # make sure text embeddings include unconditional
+        if text_embeddings is None or text_embeddings.shape[0] == B:
+            uncond = self.get_text_embeds([""] * B).to(device)
+            cond = text_embeddings.to(device) if text_embeddings is not None else uncond
+            text_embeddings_cat = torch.cat([uncond, cond], dim=0)
+        else:
+            text_embeddings_cat = text_embeddings.to(device)
         
-        # 2. 計算 latents 和 0 之間的 MSE loss
-        loss = F.mse_loss(latents, target_zeros)
+        unet_dtype = next(self.unet.parameters()).dtype
+        latents_noisy = latents_noisy.to(dtype=unet_dtype)
+        text_embeddings_cat = text_embeddings_cat.to(dtype=unet_dtype)
+        
+        # predict noise
+        noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
+
+        # gradient direction
+        grad = (noise_pred - noise)
+
+        # weight by (1 - alpha_t)
+        w_t = (1.0 - alpha_t).view(B, 1, 1, 1)
+        grad = w_t * grad
+
+        # --- [!!!] START OF THE CRITICAL FIX [!!!] ---
+        #
+        # "Pseudo-loss" that gives the correct gradient direction
+        #
+        grad_detached = grad.detach()
+        target = (latents_noisy + grad_detached).detach()
+        loss = 0.5 * F.mse_loss(latents_noisy, target, reduction="mean")
+        # --- [!!!] END OF THE CRITICAL FIX [!!!] ---
         return loss
 
 
