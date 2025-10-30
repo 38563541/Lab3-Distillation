@@ -1,4 +1,3 @@
-
 from diffusers import DDIMScheduler, DDIMInverseScheduler, StableDiffusionPipeline
 import torch
 import torch.nn as nn
@@ -28,19 +27,19 @@ class StableDiffusion(nn.Module):
         self.tokenizer = pipe.tokenizer
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet.eval()
-        
+
         # Freeze models
         for p in self.vae.parameters():
             p.requires_grad_(False)
         for p in self.unet.parameters():
             p.requires_grad_(False)
-        
+
         # Schedulers
         self.scheduler = DDIMScheduler.from_pretrained(
             model_key, subfolder="scheduler", torch_dtype=self.dtype,
         )
         self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
-        
+
         self.inverse_scheduler = DDIMInverseScheduler.from_pretrained(
             model_key, subfolder="scheduler", torch_dtype=self.dtype,
         )
@@ -52,26 +51,26 @@ class StableDiffusion(nn.Module):
         self.min_step = int(self.num_train_timesteps * t_range[0])
         self.max_step = int(self.num_train_timesteps * t_range[1])
         self.alphas = self.scheduler.alphas_cumprod
-        
+
         print(f'[INFO] Loaded Stable Diffusion!')
-        
+
         # Initialize VSD components if needed
         if args.loss_type == "vsd":
             self._init_vsd_components(args.lora_rank)
-    
+
     def _init_vsd_components(self, lora_rank=4):
         """Initialize LoRA for VSD"""
         print(f"[INFO] Initializing VSD with LoRA rank={lora_rank}")
-        
+
         self.unet.requires_grad_(False)
-        
+
         unet_lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_rank,
             init_lora_weights="gaussian",
             target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         )
-        
+
         self.unet.add_adapter(unet_lora_config)
         self.lora_layers = list(filter(lambda p: p.requires_grad, self.unet.parameters()))
 
@@ -86,7 +85,7 @@ class StableDiffusion(nn.Module):
         )
         embeddings = self.text_encoder(inputs.input_ids.to(self.device))[0]
         return embeddings
-    
+
     def get_noise_preds(self, latents_noisy, t, text_embeddings, guidance_scale=7.5):
         """
         Predict noise with Classifier-Free Guidance (CFG)
@@ -95,15 +94,15 @@ class StableDiffusion(nn.Module):
         """
         latent_model_input = torch.cat([latents_noisy] * 2)
         tt = torch.cat([t] * 2)
-        
+
         noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
         noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
-        
+
         # Classifier-Free Guidance
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
-        
+
         return noise_pred
-    
+
     def get_sds_loss(self, latents, text_embeddings, guidance_scale=7.5):
         """
         Score Distillation Sampling (SDS) Loss
@@ -119,12 +118,10 @@ class StableDiffusion(nn.Module):
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
 
         # sample noise
-        # [FIX] Force noise to be fp32
-        noise = torch.randn_like(latents, device=device, dtype=torch.float32)
+        noise = torch.randn_like(latents, device=device, dtype=latents.dtype)
 
         # create noisy latents
-        # [FIX] Force calculation to fp32. latents_noisy will be fp32.
-        latents_noisy = sqrt_alpha_t.float() * latents.float() + sqrt_one_minus_alpha_t.float() * noise
+        latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
         t_tensor = t_int.to(device).long()
 
         # make sure text embeddings include unconditional
@@ -134,31 +131,27 @@ class StableDiffusion(nn.Module):
             text_embeddings_cat = torch.cat([uncond, cond], dim=0)
         else:
             text_embeddings_cat = text_embeddings.to(device)
-        
-        # --- Cast inputs for UNet ---
+
         unet_dtype = next(self.unet.parameters()).dtype
-        # [FIX] Cast fp32 latents_noisy DOWN to unet_dtype (e.g., fp16) only for the UNet pass
-        latents_noisy_input = latents_noisy.to(dtype=unet_dtype)
+        latents_noisy = latents_noisy.to(dtype=unet_dtype)
         text_embeddings_cat = text_embeddings_cat.to(dtype=unet_dtype)
-        
+
         # predict noise
-        # noise_pred will be unet_dtype (e.g., fp16)
-        noise_pred = self.get_noise_preds(latents_noisy_input, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
+        noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
 
         # gradient direction
-        # [FIX] Cast noise_pred UP to fp32. 'noise' is already fp32.
-        grad = (noise_pred.float() - noise)
+        grad = (noise_pred - noise)
 
         # weight by (1 - alpha_t)
-        # [FIX] Ensure w_t is fp32
-        w_t = (1.0 - alpha_t).view(B, 1, 1, 1).float()
+        w_t = (1.0 - alpha_t).view(B, 1, 1, 1)
         grad = w_t * grad
 
         # --- [!!!] START OF THE CRITICAL FIX [!!!] ---
+        #
         # "Pseudo-loss" that gives the correct gradient direction
         #
         grad_detached = grad.detach()
-        # [FIX] Use the fp32 latents_noisy for the loss calculation
+        
         target = (latents_noisy - grad_detached).detach()
         loss = 0.5 * F.mse_loss(latents_noisy, target, reduction="mean")
         # --- [!!!] END OF THE CRITICAL FIX [!!!] ---
@@ -175,35 +168,25 @@ class StableDiffusion(nn.Module):
         # TODO: Implement VSD loss
         # Here: implement a practical variant: SDS loss + L2 regularization on trainable LoRA params (if present)
         # - This captures the "variational" regularization on learned adapter weights.
-        
-        """
-        Variational Score Distillation (VSD) Loss
-        [MODIFIED FOR FP32 STABILITY]
-        """
-        
+
         # Base SDS-style loss
-        # 假設 get_sds_loss 已經被修復並返回 fp32 loss
         sds_loss = self.get_sds_loss(latents, text_embeddings, guidance_scale=guidance_scale)
-        
-        # LoRA regularization
-        # [FIX] 強制正規化計算在 fp32 下進行
-        lora_reg = torch.tensor(0.0, device=latents.device, dtype=torch.float32)
-        
+
+        # LoRA regularization (if LoRA adapters exist and have trainable params)
+        lora_reg = torch.tensor(0.0, device=latents.device, dtype=latents.dtype)
         if hasattr(self, 'lora_layers') and len(self.lora_layers) > 0:
-            total_elems = 0
+            # lora_layers is a list of trainable params
             for p in self.lora_layers:
                 if p.requires_grad:
-                    # [FIX] 在 pow(2) 之前將 p 轉換為 fp32 以防止溢出
-                    lora_reg = lora_reg + (p.float().pow(2).sum())
-                    total_elems += p.numel()
-            
+                    lora_reg = lora_reg + (p.pow(2).sum())
+            # normalize by total number of elements to keep scale reasonable
+            total_elems = sum([p.numel() for p in self.lora_layers if p.requires_grad])
             if total_elems > 0:
                 lora_reg = lora_reg / total_elems
-        
-        # [FIX] sds_loss 是 fp32, lora_reg 是 fp32. loss_weight 也應為 fp32.
-        loss = sds_loss + float(lora_loss_weight) * lora_reg
+
+        loss = sds_loss + lora_loss_weight * lora_reg
         return loss
-    
+
     @torch.no_grad()
     def invert_noise(self, latents, target_t, text_embeddings, guidance_scale=-7.5, n_steps=10, eta=0.3):
         """
@@ -229,10 +212,10 @@ class StableDiffusion(nn.Module):
         # If n_steps > 1 we optionally perform multiple intermediate steps by
         # progressively adding noise — implemented here as a simple schedule
         # interpolating from t=0 -> target_t (not model-based iterative inversion).
-        
+
         B = latents.shape[0]
         device = latents.device
-        
+
         # Accept target_t as int or tensor; compute integer index in [0, num_train_timesteps-1]
         if isinstance(target_t, (list, tuple)):
             target_t_tensor = torch.tensor(target_t, device=device, dtype=torch.long)
@@ -241,15 +224,15 @@ class StableDiffusion(nn.Module):
         else:
             # assume int scalar
             target_t_tensor = torch.full((B,), int(target_t), device=device, dtype=torch.long)
-        
+
         # clamp target timesteps within scheduler range
         target_t_tensor = torch.clamp(target_t_tensor, 0, self.num_train_timesteps - 1)
-        
+
         # gather alpha_t
         alpha_t = self.alphas[target_t_tensor].to(device)  # (B,)
         sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
-        
+
         # We will create noise according to eta:
         # - if eta == 0 -> deterministic (zero noise)
         # - if eta > 0 -> add scaled Gaussian noise
@@ -257,12 +240,12 @@ class StableDiffusion(nn.Module):
             noise = torch.zeros_like(latents, device=device, dtype=latents.dtype)
         else:
             noise = torch.randn_like(latents, device=device, dtype=latents.dtype) * eta
-        
+
         # closed-form mapping from x0 -> x_t
         latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
-        
+
         return latents_noisy
-    
+
     def get_sdi_loss(
         self, 
         latents,                    
@@ -284,7 +267,7 @@ class StableDiffusion(nn.Module):
         to get better noise that's consistent with the current latents.
         """
         B = latents.shape[0]
-        
+
         # timestep annealing: linear from max_step -> min_step
         if total_iters <= 1:
             t_index = self.max_step
@@ -294,13 +277,13 @@ class StableDiffusion(nn.Module):
             t_float = self.max_step - frac * (self.max_step - self.min_step)
             t_index = int(round(t_float))
         t_index = int(max(0, min(self.num_train_timesteps - 1, t_index)))
-        
+
         device = latents.device
         t = torch.full((B,), t_index, device=device, dtype=torch.long)
-        
+
         # update target periodically or if not present
         should_update = (current_iter % update_interval == 0) or not hasattr(self, 'sdi_target')
-        
+
         if should_update:
             with torch.no_grad():
                 # Perform DDIM inversion: x0 -> x_t (closed-form mapping with eta)
@@ -310,7 +293,7 @@ class StableDiffusion(nn.Module):
                     n_steps=inversion_n_steps,
                     eta=inversion_eta
                 )
-                
+
                 # ensure text embeddings shape is 2*B if needed
                 if text_embeddings is None:
                     text_embeddings_cat = torch.cat([self.get_text_embeds([""] * B), self.get_text_embeds([""] * B)], dim=0).to(device)
@@ -320,29 +303,29 @@ class StableDiffusion(nn.Module):
                         text_embeddings_cat = torch.cat([uncond, text_embeddings.to(device)], dim=0)
                     else:
                         text_embeddings_cat = text_embeddings.to(device)
-                
+
                 # predict noise using inversion guidance scale (may be negative)
                 noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings_cat, guidance_scale=inversion_guidance_scale)
-                
+
                 # denoise to compute predicted x0
                 alpha_t = self.alphas[t].to(device)  # (B,)
                 sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
                 sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
-                
+
                 pred_x0 = (latents_noisy - sqrt_one_minus_alpha_t * noise_pred) / (sqrt_alpha_t + 1e-12)
-                
+
                 # cache target
                 self.sdi_target = pred_x0.detach()
-        
+
         if not hasattr(self, 'sdi_target'):
             loss = torch.tensor(0.0, device=device, dtype=latents.dtype)
         else:
             loss = F.mse_loss(latents, self.sdi_target.to(device), reduction='mean')
-        
+
         return loss
-        
+
     @torch.no_grad()
-    
+
     def decode_latents(self, latents):
         """Decode latents to RGB images"""
         # --- make sure dtype & scaling factor match VAE expectation ---
@@ -353,7 +336,7 @@ class StableDiffusion(nn.Module):
             latents = latents / self.vae.config.scaling_factor
         else:
             latents = latents / 0.18215  # fallback
-        
+
         imgs = self.vae.decode(latents).sample
         imgs = (imgs / 2 + 0.5).clamp(0, 1)  # scale to [0,1]
         imgs = imgs.float()  # convert for visualization
@@ -374,4 +357,3 @@ class StableDiffusion(nn.Module):
         posterior = self.vae.encode(imgs).latent_dist
         latents = posterior.sample() * self.vae.config.scaling_factor
         return latents
-
