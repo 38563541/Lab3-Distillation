@@ -176,22 +176,32 @@ class StableDiffusion(nn.Module):
         # Here: implement a practical variant: SDS loss + L2 regularization on trainable LoRA params (if present)
         # - This captures the "variational" regularization on learned adapter weights.
         
+        """
+        Variational Score Distillation (VSD) Loss
+        [MODIFIED FOR FP32 STABILITY]
+        """
+        
         # Base SDS-style loss
+        # 假設 get_sds_loss 已經被修復並返回 fp32 loss
         sds_loss = self.get_sds_loss(latents, text_embeddings, guidance_scale=guidance_scale)
         
-        # LoRA regularization (if LoRA adapters exist and have trainable params)
-        lora_reg = torch.tensor(0.0, device=latents.device, dtype=latents.dtype)
+        # LoRA regularization
+        # [FIX] 強制正規化計算在 fp32 下進行
+        lora_reg = torch.tensor(0.0, device=latents.device, dtype=torch.float32)
+        
         if hasattr(self, 'lora_layers') and len(self.lora_layers) > 0:
-            # lora_layers is a list of trainable params
+            total_elems = 0
             for p in self.lora_layers:
                 if p.requires_grad:
-                    lora_reg = lora_reg + (p.pow(2).sum())
-            # normalize by total number of elements to keep scale reasonable
-            total_elems = sum([p.numel() for p in self.lora_layers if p.requires_grad])
+                    # [FIX] 在 pow(2) 之前將 p 轉換為 fp32 以防止溢出
+                    lora_reg = lora_reg + (p.float().pow(2).sum())
+                    total_elems += p.numel()
+            
             if total_elems > 0:
                 lora_reg = lora_reg / total_elems
         
-        loss = sds_loss + lora_loss_weight * lora_reg
+        # [FIX] sds_loss 是 fp32, lora_reg 是 fp32. loss_weight 也應為 fp32.
+        loss = sds_loss + float(lora_loss_weight) * lora_reg
         return loss
     
     @torch.no_grad()
