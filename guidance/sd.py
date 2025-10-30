@@ -119,10 +119,12 @@ class StableDiffusion(nn.Module):
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
 
         # sample noise
-        noise = torch.randn_like(latents, device=device, dtype=latents.dtype)
+        # [FIX] Force noise to be fp32
+        noise = torch.randn_like(latents, device=device, dtype=torch.float32)
 
         # create noisy latents
-        latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
+        # [FIX] Force calculation to fp32. latents_noisy will be fp32.
+        latents_noisy = sqrt_alpha_t.float() * latents.float() + sqrt_one_minus_alpha_t.float() * noise
         t_tensor = t_int.to(device).long()
 
         # make sure text embeddings include unconditional
@@ -133,25 +135,30 @@ class StableDiffusion(nn.Module):
         else:
             text_embeddings_cat = text_embeddings.to(device)
         
+        # --- Cast inputs for UNet ---
         unet_dtype = next(self.unet.parameters()).dtype
-        latents_noisy = latents_noisy.to(dtype=unet_dtype)
+        # [FIX] Cast fp32 latents_noisy DOWN to unet_dtype (e.g., fp16) only for the UNet pass
+        latents_noisy_input = latents_noisy.to(dtype=unet_dtype)
         text_embeddings_cat = text_embeddings_cat.to(dtype=unet_dtype)
         
         # predict noise
-        noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
+        # noise_pred will be unet_dtype (e.g., fp16)
+        noise_pred = self.get_noise_preds(latents_noisy_input, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
 
         # gradient direction
-        grad = (noise_pred - noise)
+        # [FIX] Cast noise_pred UP to fp32. 'noise' is already fp32.
+        grad = (noise_pred.float() - noise)
 
         # weight by (1 - alpha_t)
-        w_t = (1.0 - alpha_t).view(B, 1, 1, 1)
+        # [FIX] Ensure w_t is fp32
+        w_t = (1.0 - alpha_t).view(B, 1, 1, 1).float()
         grad = w_t * grad
 
         # --- [!!!] START OF THE CRITICAL FIX [!!!] ---
-        #
         # "Pseudo-loss" that gives the correct gradient direction
         #
         grad_detached = grad.detach()
+        # [FIX] Use the fp32 latents_noisy for the loss calculation
         target = (latents_noisy - grad_detached).detach()
         loss = 0.5 * F.mse_loss(latents_noisy, target, reduction="mean")
         # --- [!!!] END OF THE CRITICAL FIX [!!!] ---
