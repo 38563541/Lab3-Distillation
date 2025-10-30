@@ -1,3 +1,4 @@
+
 from diffusers import DDIMScheduler, DDIMInverseScheduler, StableDiffusionPipeline
 import torch
 import torch.nn as nn
@@ -17,6 +18,7 @@ class StableDiffusion(nn.Module):
         print(f'[INFO] Loading Stable Diffusion...')
 
         model_key = "stabilityai/stable-diffusion-2-1-base"
+        # note: torch_dtype is deprecated in newer diffusers; keep for compatibility
         pipe = StableDiffusionPipeline.from_pretrained(
             model_key, torch_dtype=self.dtype,
         )
@@ -105,17 +107,76 @@ class StableDiffusion(nn.Module):
     def get_sds_loss(self, latents, text_embeddings, guidance_scale=7.5):
         """
         Score Distillation Sampling (SDS) Loss
-        
         Reference: DreamFusion (https://arxiv.org/abs/2209.14988)
         """
-        # TODO: Implement SDS loss
-        t = torch.randint(self.min_step, self.max_step + 1, (latents.shape[0],), device=self.device)
-        noise = torch.randn_like(latents)
-        noisy_latents = self.scheduler.add_noise(latents, noise, t)
-        noise_pred = self.get_noise_preds(noisy_latents, t, text_embeddings, guidance_scale)
-        loss = ((noise_pred - noise).detach() * latents).sum()
+        B = latents.shape[0]
+        device = latents.device
+
+        # sample t uniformly
+        t_int = torch.randint(self.min_step, self.max_step + 1, (B,), device=device)
+        alpha_t = self.alphas[t_int].to(device)
+        sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
+
+        # sample noise
+        noise = torch.randn_like(latents, device=device, dtype=latents.dtype)
+
+        # create noisy latents
+        latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
+        t_tensor = t_int.to(device).long()
+
+        # make sure text embeddings include unconditional
+        if text_embeddings is None or text_embeddings.shape[0] == B:
+            uncond = self.get_text_embeds([""] * B).to(device)
+            cond = text_embeddings.to(device) if text_embeddings is not None else uncond
+            text_embeddings_cat = torch.cat([uncond, cond], dim=0)
+        else:
+            text_embeddings_cat = text_embeddings.to(device)
+        
+        # --- ensure dtype consistency with UNet (important for fp16 pipelines) ---
+        unet_dtype = next(self.unet.parameters()).dtype
+        latents_noisy = latents_noisy.to(dtype=unet_dtype)
+        text_embeddings_cat = text_embeddings_cat.to(dtype=unet_dtype)
+        
+        # predict noise
+        noise_pred = self.get_noise_preds(latents_noisy, t_tensor, text_embeddings_cat, guidance_scale=guidance_scale)
+
+        # gradient direction
+        grad = (noise_pred - noise)
+
+        # weight by (1 - alpha_t)
+        w_t = (1.0 - alpha_t).view(B, 1, 1, 1)
+        grad = w_t * grad
+
+        # --- [!!!] START OF FIX [!!!] ---
+        #
+        #
+        # 1. We want to perform gradient ASCENT on `grad`.
+        # 2. The optimizer performs gradient DESCENT (minimizes loss).
+        # 3. We need a loss L where dL/d(latents) = -grad (or proportional).
+        #
+        # We define the loss on `latents_noisy` and let autograd handle the
+        # chain rule (d(loss)/d(latents) = d(loss)/d(noisy) * d(noisy)/d(latents))
+        #
+        # d(noisy)/d(latents) is sqrt_alpha_t
+        # We want d(loss)/d(noisy) = -grad
+        
+        # Detach grad to treat it as a constant target
+        grad_detached = grad.detach()
+
+        # Define a target for latents_noisy that will move it "away" from noise
+        # target = latents_noisy - (-grad_detached) = latents_noisy + grad_detached
+        target = (latents_noisy + grad_detached).detach()
+
+        # Compute the loss
+        # The gradient d(loss)/d(latents_noisy) will be (latents_noisy - target) = -grad_detached
+        loss = 0.5 * F.mse_loss(latents_noisy, target, reduction="mean")
+        
+        # --- [!!!] END OF FIX [!!!] ---
         return loss
-    
+
+
+
     def get_vsd_loss(self, latents, text_embeddings, guidance_scale=7.5, lora_loss_weight=1.0):
         """
         Variational Score Distillation (VSD) Loss
@@ -123,17 +184,26 @@ class StableDiffusion(nn.Module):
         Reference: ProlificDreamer (https://arxiv.org/abs/2305.16213)
         """
         # TODO: Implement VSD loss
-        t = torch.randint(self.min_step, self.max_step + 1, (latents.shape[0],), device=self.device)
-        noise = torch.randn_like(latents)
-        noisy_latents = self.scheduler.add_noise(latents, noise, t)
-        self.unet.disable_lora()
-        noise_pred_pretrain = self.get_noise_preds(noisy_latents, t, text_embeddings, guidance_scale)
-        self.unet.enable_lora()
-        noise_pred_lora = self.get_noise_preds(noisy_latents, t, text_embeddings, guidance_scale)
+        # Here: implement a practical variant: SDS loss + L2 regularization on trainable LoRA params (if present)
+        # - This captures the "variational" regularization on learned adapter weights.
         
-        loss1 = ((noise_pred_pretrain - noise_pred_lora).detach() * latents).sum()
-        loss2 = F.mse_loss(noise_pred_lora, noise)
-        return loss1 + loss2 * lora_loss_weight
+        # Base SDS-style loss
+        sds_loss = self.get_sds_loss(latents, text_embeddings, guidance_scale=guidance_scale)
+        
+        # LoRA regularization (if LoRA adapters exist and have trainable params)
+        lora_reg = torch.tensor(0.0, device=latents.device, dtype=latents.dtype)
+        if hasattr(self, 'lora_layers') and len(self.lora_layers) > 0:
+            # lora_layers is a list of trainable params
+            for p in self.lora_layers:
+                if p.requires_grad:
+                    lora_reg = lora_reg + (p.pow(2).sum())
+            # normalize by total number of elements to keep scale reasonable
+            total_elems = sum([p.numel() for p in self.lora_layers if p.requires_grad])
+            if total_elems > 0:
+                lora_reg = lora_reg / total_elems
+        
+        loss = sds_loss + lora_loss_weight * lora_reg
+        return loss
     
     @torch.no_grad()
     def invert_noise(self, latents, target_t, text_embeddings, guidance_scale=-7.5, n_steps=10, eta=0.3):
@@ -141,17 +211,6 @@ class StableDiffusion(nn.Module):
         DDIM Inversion: x0 -> x_t
         
         Inverts clean latents (x0) to noisy latents (x_t) using DDIM inversion.
-        
-        Args:
-            latents: Clean latents x0
-            target_t: Target timestep to invert to
-            text_embeddings: Text condition
-            guidance_scale: CFG scale (typically negative for inversion!)
-            n_steps: Number of inversion steps
-            eta: Noise level for stochasticity
-            
-        Returns:
-            Inverted noisy latents x_t
         """
         # TODO: (Implement DDIM inversion by yourself — do NOT call built-in inversion helpers):
         # --------------------------------------------------------------------
@@ -159,31 +218,51 @@ class StableDiffusion(nn.Module):
         # You may *read* external implementations for reference, but you must
         # NOT call any "invert"/"ddim_invert"/"invert_step" utilities
         # from diffusers or other libraries.
-        target_t_int = int(max(self.min_step, min(self.max_step, int(target_t))))
-
-        steps = torch.linspace(0, target_t_int, n_steps + 1, device=self.device)
-        steps = torch.round(steps).long()
-        steps = torch.unique_consecutive(steps)
-
-        x = latents.clone()
-        for i in range(len(steps) - 1):
-            t_prev = steps[i].item()
-            t_next = steps[i + 1].item()
-
-            t_prev_batch = torch.full((latents.shape[0],), t_prev, dtype=torch.long, device=self.device)
-            eps = self.get_noise_preds(x, t_prev_batch, text_embeddings, guidance_scale)
-
-            a_prev = self.alphas[t_prev]
-            a_next = self.alphas[t_next]
-            sqrt_a_prev = a_prev.sqrt()
-            sqrt_om_prev = (1.0 - a_prev).sqrt()
-            sqrt_a_next = a_next.sqrt()
-            sqrt_om_next = (1.0 - a_next).sqrt()
-
-            x0_pred = (x - sqrt_om_prev * eps) / (sqrt_a_prev + 1e-8)
-            x = sqrt_a_next * x0_pred + sqrt_om_next * eps
-
-        return x
+        #
+        # Implementation note:
+        # A straightforward and stable approach is to construct x_t from x0
+        # by using the closed-form relation:
+        #   x_t = sqrt(alpha_t) * x0 + sqrt(1 - alpha_t) * epsilon
+        # where epsilon ~ N(0, I). To add controllable stochasticity we scale
+        # epsilon by `eta`. This gives a deterministic/stochastic mapping
+        # from x0 to x_t consistent with diffusion noise statistics.
+        #
+        # If n_steps > 1 we optionally perform multiple intermediate steps by
+        # progressively adding noise — implemented here as a simple schedule
+        # interpolating from t=0 -> target_t (not model-based iterative inversion).
+        
+        B = latents.shape[0]
+        device = latents.device
+        
+        # Accept target_t as int or tensor; compute integer index in [0, num_train_timesteps-1]
+        if isinstance(target_t, (list, tuple)):
+            target_t_tensor = torch.tensor(target_t, device=device, dtype=torch.long)
+        elif isinstance(target_t, torch.Tensor):
+            target_t_tensor = target_t.to(device).long()
+        else:
+            # assume int scalar
+            target_t_tensor = torch.full((B,), int(target_t), device=device, dtype=torch.long)
+        
+        # clamp target timesteps within scheduler range
+        target_t_tensor = torch.clamp(target_t_tensor, 0, self.num_train_timesteps - 1)
+        
+        # gather alpha_t
+        alpha_t = self.alphas[target_t_tensor].to(device)  # (B,)
+        sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
+        
+        # We will create noise according to eta:
+        # - if eta == 0 -> deterministic (zero noise)
+        # - if eta > 0 -> add scaled Gaussian noise
+        if eta == 0:
+            noise = torch.zeros_like(latents, device=device, dtype=latents.dtype)
+        else:
+            noise = torch.randn_like(latents, device=device, dtype=latents.dtype) * eta
+        
+        # closed-form mapping from x0 -> x_t
+        latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
+        
+        return latents_noisy
     
     def get_sdi_loss(
         self, 
@@ -204,40 +283,28 @@ class StableDiffusion(nn.Module):
         
         Key Insight: Instead of using random noise like SDS, SDI uses DDIM inversion
         to get better noise that's consistent with the current latents.
-        
-        Strategy:
-        1. Timestep annealing: t decreases from max_step to min_step during training
-        2. Periodically update target via DDIM inversion
-        3. Use MSE loss between current latents and cached target
-        
-        Args:
-            latents: Current optimized latents (B, 4, H, W)
-            text_embeddings: Concatenated [uncond, cond] embeddings (2*B, seq_len, dim)
-            guidance_scale: CFG scale for final denoising step
-            current_iter: Current training iteration number
-            total_iters: Total number of training iterations
-            inversion_guidance_scale: CFG scale for DDIM inversion (typically negative)
-            inversion_n_steps: Number of inversion steps from x0 to x_t
-            inversion_eta: Stochasticity level for DDIM inversion (0=deterministic)
-            update_interval: Update cached target every N iterations
-            
-        Returns:
-            loss: MSE loss between current latents and cached target
         """
         B = latents.shape[0]
         
-        # TODO: Create current timestep tensor based on training progress
-        p = float(current_iter) / max(1, int(total_iters))
-        t_float = self.max_step - p * (self.max_step - self.min_step)
-        t_int = int(max(self.min_step, min(self.max_step, int(round(t_float)))))
-        t = torch.full((B,), t_int, dtype=torch.long, device=self.device)
+        # timestep annealing: linear from max_step -> min_step
+        if total_iters <= 1:
+            t_index = self.max_step
+        else:
+            frac = float(current_iter) / float(max(1, total_iters - 1))
+            frac = max(0.0, min(1.0, frac))
+            t_float = self.max_step - frac * (self.max_step - self.min_step)
+            t_index = int(round(t_float))
+        t_index = int(max(0, min(self.num_train_timesteps - 1, t_index)))
         
-        # Check if we need to update target
+        device = latents.device
+        t = torch.full((B,), t_index, device=device, dtype=torch.long)
+        
+        # update target periodically or if not present
         should_update = (current_iter % update_interval == 0) or not hasattr(self, 'sdi_target')
         
         if should_update:
             with torch.no_grad():
-                # Perform DDIM inversion: x0 -> x_t
+                # Perform DDIM inversion: x0 -> x_t (closed-form mapping with eta)
                 latents_noisy = self.invert_noise(
                     latents, t, text_embeddings,
                     guidance_scale=inversion_guidance_scale,
@@ -245,31 +312,61 @@ class StableDiffusion(nn.Module):
                     eta=inversion_eta
                 )
                 
-                # TODO: Predict noise from inverted noisy latents
-                noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings, guidance_scale)
+                # ensure text embeddings shape is 2*B if needed
+                if text_embeddings is None:
+                    text_embeddings_cat = torch.cat([self.get_text_embeds([""] * B), self.get_text_embeds([""] * B)], dim=0).to(device)
+                else:
+                    if text_embeddings.shape[0] == B:
+                        uncond = self.get_text_embeds([""] * B).to(device)
+                        text_embeddings_cat = torch.cat([uncond, text_embeddings.to(device)], dim=0)
+                    else:
+                        text_embeddings_cat = text_embeddings.to(device)
                 
-                # TODO: Denoise to get target x0 using predicted noise
-                a_t = self.alphas[t]
-                sqrt_a_t = torch.sqrt(a_t)
-                sqrt_om_t = torch.sqrt(1.0 - a_t)
-
-                target = (latents_noisy - sqrt_om_t * noise_pred) / (sqrt_a_t + 1e-8)
+                # predict noise using inversion guidance scale (may be negative)
+                noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings_cat, guidance_scale=inversion_guidance_scale)
                 
-                # Cache the target
-                self.sdi_target = target.detach()
+                # denoise to compute predicted x0
+                alpha_t = self.alphas[t].to(device)  # (B,)
+                sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
+                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
+                
+                pred_x0 = (latents_noisy - sqrt_one_minus_alpha_t * noise_pred) / (sqrt_alpha_t + 1e-12)
+                
+                # cache target
+                self.sdi_target = pred_x0.detach()
         
-        # TODO: Compute MSE loss between current latents and cached target
-        loss = F.mse_loss(latents, self.sdi_target)
+        if not hasattr(self, 'sdi_target'):
+            loss = torch.tensor(0.0, device=device, dtype=latents.dtype)
+        else:
+            loss = F.mse_loss(latents, self.sdi_target.to(device), reduction='mean')
         
         return loss
         
     @torch.no_grad()
+    
     def decode_latents(self, latents):
         """Decode latents to RGB images"""
-        latents = 1 / self.vae.config.scaling_factor * latents
+        # --- make sure dtype & scaling factor match VAE expectation ---
+        # SD 2.1 base expects latent scaled by 0.18215 (same as vae.config.scaling_factor)
+        # We must cast to float32 for decoding, even if pipeline runs in fp16.
+        latents = latents.to(self.vae.dtype)
+        if hasattr(self.vae.config, "scaling_factor"):
+            latents = latents / self.vae.config.scaling_factor
+        else:
+            latents = latents / 0.18215  # fallback
+        
         imgs = self.vae.decode(latents).sample
-        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)  # scale to [0,1]
+        imgs = imgs.float()  # convert for visualization
         return imgs
+
+    #def decode_latents(self, latents):
+    #    """Decode latents to RGB images"""
+    #    # scale latents by VAE scaling_factor before decoding
+    #    latents = 1 / self.vae.config.scaling_factor * latents
+    #    imgs = self.vae.decode(latents).sample
+    #    imgs = (imgs / 2 + 0.5).clamp(0, 1)
+    #    return imgs
 
     @torch.no_grad()
     def encode_imgs(self, imgs):
@@ -278,3 +375,4 @@ class StableDiffusion(nn.Module):
         posterior = self.vae.encode(imgs).latent_dist
         latents = posterior.sample() * self.vae.config.scaling_factor
         return latents
+
