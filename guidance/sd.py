@@ -152,7 +152,7 @@ class StableDiffusion(nn.Module):
         # "Pseudo-loss" that gives the correct gradient direction
         #
         grad_detached = grad.detach()
-        target = (latents_noisy + grad_detached).detach()
+        target = (latents_noisy - grad_detached).detach()
         loss = 0.5 * F.mse_loss(latents_noisy, target, reduction="mean")
         # --- [!!!] END OF THE CRITICAL FIX [!!!] ---
         return loss
