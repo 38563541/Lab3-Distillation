@@ -215,37 +215,77 @@ class StableDiffusion(nn.Module):
 
         B = latents.shape[0]
         device = latents.device
-
-        # Accept target_t as int or tensor; compute integer index in [0, num_train_timesteps-1]
-        if isinstance(target_t, (list, tuple)):
-            target_t_tensor = torch.tensor(target_t, device=device, dtype=torch.long)
-        elif isinstance(target_t, torch.Tensor):
-            target_t_tensor = target_t.to(device).long()
+        
+        # 1. 準備 text embeddings (與您原本的程式碼相同)
+        if text_embeddings is None:
+            uncond = self.get_text_embeds([""] * B).to(device)
+            text_embeddings_cat = torch.cat([uncond, uncond], dim=0)
         else:
-            # assume int scalar
-            target_t_tensor = torch.full((B,), int(target_t), device=device, dtype=torch.long)
+            if text_embeddings.shape[0] == B:
+                uncond = self.get_text_embeds([""] * B).to(device)
+                text_embeddings_cat = torch.cat([uncond, text_embeddings.to(device)], dim=0)
+            else:
+                text_embeddings_cat = text_embeddings.to(device)
+                
+        unet_dtype = next(self.unet.parameters()).dtype
+        text_embeddings_cat = text_embeddings_cat.to(dtype=unet_dtype)
 
-        # clamp target timesteps within scheduler range
-        target_t_tensor = torch.clamp(target_t_tensor, 0, self.num_train_timesteps - 1)
+        # 2. 設置 timesteps (與您原本的程式碼相同)
+        target_t_int = int(target_t[0]) if isinstance(target_t, torch.Tensor) else int(target_t)
+        target_t_int = max(target_t_int, 1) 
+        timesteps = torch.linspace(0, target_t_int, n_steps + 1, device=device, dtype=torch.long)
+        
+        # 3. 執行 DDIM Inversion 迴圈 (與您原本的程式碼相同)
+        x_current = latents.to(dtype=unet_dtype) 
 
-        # gather alpha_t
-        alpha_t = self.alphas[target_t_tensor].to(device)  # (B,)
-        sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
-        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
+        for i in range(n_steps):
+            t_current = timesteps[i]
+            t_next = timesteps[i+1]
+            t_current_tensor = torch.full((B,), t_current, device=device, dtype=torch.long)
 
-        # We will create noise according to eta:
-        # - if eta == 0 -> deterministic (zero noise)
-        # - if eta > 0 -> add scaled Gaussian noise
-        if eta == 0:
-            noise = torch.zeros_like(latents, device=device, dtype=latents.dtype)
-        else:
-            noise = torch.randn_like(latents, device=device, dtype=latents.dtype) * eta
+            # (1) 取得 alpha (與您原本的程式碼相同)
+            alpha_current = self.alphas[t_current].to(device).view(B, 1, 1, 1)
+            alpha_next = self.alphas[t_next].to(device).view(B, 1, 1, 1)
+            
+            # (2) 預測噪聲 (與您原本的程式碼相同)
+            noise_pred = self.get_noise_preds(
+                x_current, 
+                t_current_tensor, 
+                text_embeddings_cat, 
+                guidance_scale=guidance_scale
+            )
+            
+            # (3) 計算 pred_x0 (與您原本的程式碼相同)
+            pred_x0 = (x_current - torch.sqrt(1.0 - alpha_current) * noise_pred) / (torch.sqrt(alpha_current) + 1e-12)
 
-        # closed-form mapping from x0 -> x_t
-        latents_noisy = sqrt_alpha_t * latents + sqrt_one_minus_alpha_t * noise
+            # (4) 計算 x_next (與您原本的程式碼相同)
+            x_next = torch.sqrt(alpha_next) * pred_x0 + torch.sqrt(1.0 - alpha_next) * noise_pred
 
-        return latents_noisy
-
+            # (5) [!!!] --- 這是【真正】的修正點 --- [!!!]
+            if eta > 0:
+                # DDIM (https://arxiv.org/abs/2010.02502) - Eq. 12
+                # 我們需要 sigma^2 = eta^2 * (1 - alpha_{t-1}) / (1 - alpha_t) * (1 - alpha_t / alpha_{t-1})
+                # t-1 = t_current, t = t_next
+                
+                # 【錯誤】的版本 (會產生負數):
+                # variance = ( (1.0 - alpha_next) / (1.0 - alpha_current) ) * (1.0 - alpha_current / (alpha_next + 1e-12) )
+                
+                # 【正確】的版本 (alpha_current 和 alpha_next 的位置被修正):
+                variance_term_1 = (1.0 - alpha_current) / (1.0 - alpha_next + 1e-12)
+                variance_term_2 = (1.0 - alpha_next / (alpha_current + 1e-12))
+                
+                # 為了數值穩定，clamp 確保 variance 永遠 >= 0
+                variance = torch.clamp(variance_term_1 * variance_term_2, min=0)
+                
+                sigma = eta * torch.sqrt(variance)
+                
+                noise = torch.randn_like(noise_pred)
+                x_next = x_next + sigma * noise
+            
+            # (6) 更新 x_current (与您原本的程式码相同)
+            x_current = x_next
+            
+        return x_current.detach()
     def get_sdi_loss(
         self, 
         latents,                    
@@ -267,8 +307,9 @@ class StableDiffusion(nn.Module):
         to get better noise that's consistent with the current latents.
         """
         B = latents.shape[0]
+        device = latents.device
 
-        # timestep annealing: linear from max_step -> min_step
+        # 1. Timestep annealing (與您原本的程式碼相同)
         if total_iters <= 1:
             t_index = self.max_step
         else:
@@ -276,54 +317,71 @@ class StableDiffusion(nn.Module):
             frac = max(0.0, min(1.0, frac))
             t_float = self.max_step - frac * (self.max_step - self.min_step)
             t_index = int(round(t_float))
+        
         t_index = int(max(0, min(self.num_train_timesteps - 1, t_index)))
-
-        device = latents.device
         t = torch.full((B,), t_index, device=device, dtype=torch.long)
 
-        # update target periodically or if not present
+        # 2. update target periodically (與您原本的程式碼相同)
         should_update = (current_iter % update_interval == 0) or not hasattr(self, 'sdi_target')
 
         if should_update:
             with torch.no_grad():
-                # Perform DDIM inversion: x0 -> x_t (closed-form mapping with eta)
+                
+                # 2a. 呼叫 *新* 的 invert_noise (方法 A)
+                # 這裡會使用到 n_steps, eta, 和 inversion_guidance_scale
                 latents_noisy = self.invert_noise(
                     latents, t, text_embeddings,
-                    guidance_scale=inversion_guidance_scale,
-                    n_steps=inversion_n_steps,
-                    eta=inversion_eta
+                    guidance_scale=inversion_guidance_scale, # <-- 傳入 -7.5
+                    n_steps=inversion_n_steps,           
+                    eta=inversion_eta                    
                 )
 
-                # ensure text embeddings shape is 2*B if needed
+                # 2b. 準備 text embeddings (與您原本的程式碼相同)
                 if text_embeddings is None:
-                    text_embeddings_cat = torch.cat([self.get_text_embeds([""] * B), self.get_text_embeds([""] * B)], dim=0).to(device)
+                    uncond = self.get_text_embeds([""] * B).to(device)
+                    text_embeddings_cat = torch.cat([uncond, uncond], dim=0)
                 else:
                     if text_embeddings.shape[0] == B:
                         uncond = self.get_text_embeds([""] * B).to(device)
                         text_embeddings_cat = torch.cat([uncond, text_embeddings.to(device)], dim=0)
                     else:
                         text_embeddings_cat = text_embeddings.to(device)
+                
+                unet_dtype = next(self.unet.parameters()).dtype
+                latents_noisy = latents_noisy.to(dtype=unet_dtype)
+                text_embeddings_cat = text_embeddings_cat.to(dtype=unet_dtype)
 
-                # predict noise using inversion guidance scale (may be negative)
-                noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings_cat, guidance_scale=inversion_guidance_scale)
+                # 2c. [!!!] --- 這是您 *第二個* 錯誤的修正點 --- [!!!]
+                # 
+                # 為了計算最終的 *目標* pred_x0，
+                # 您必須使用 *正的* guidance_scale (例如 50 或 10)
+                #
+                # 錯誤的版本 (使用 -7.5):
+                # noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings_cat, guidance_scale=inversion_guidance_scale)
+                #
+                # 正確的版本 (使用 50 或 10):
+                noise_pred = self.get_noise_preds(latents_noisy, t, text_embeddings_cat, guidance_scale=guidance_scale)
+                #
+                # [!!!] --- 修正完畢 --- [!!!]
 
-                # denoise to compute predicted x0
-                alpha_t = self.alphas[t].to(device)  # (B,)
-                sqrt_alpha_t = torch.sqrt(alpha_t).view(B, 1, 1, 1)
-                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t).view(B, 1, 1, 1)
+                # 2d. 計算 pred_x0 (與您原本的程式碼相同)
+                alpha_t = self.alphas[t].to(device).view(B, 1, 1, 1)
+                sqrt_alpha_t = torch.sqrt(alpha_t)
+                sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
 
                 pred_x0 = (latents_noisy - sqrt_one_minus_alpha_t * noise_pred) / (sqrt_alpha_t + 1e-12)
 
-                # cache target
+                # 2e. 快取 target (與您原本的程式碼相同)
                 self.sdi_target = pred_x0.detach()
 
+        # 3. 計算 loss (與您原本的程式碼相同)
         if not hasattr(self, 'sdi_target'):
             loss = torch.tensor(0.0, device=device, dtype=latents.dtype)
         else:
             loss = F.mse_loss(latents, self.sdi_target.to(device), reduction='mean')
 
         return loss
-
+       
     @torch.no_grad()
 
     def decode_latents(self, latents):
